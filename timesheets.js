@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BSC Time sheets
 // @namespace    http://tampermonkey.net/
-// @version      2025-11-10
-// @description  try to take over the world!
+// @version      2026-02-05
+// @description  Auto-fill BSC timesheets
 // @author       You
 // @match        https://opstrs03.bsc.es/Time*heet/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsc.es
@@ -17,10 +17,7 @@
   function roundHalf(n) { return Math.round(n * 2) / 2; }
 
     var TIMESHEETALERTS = false;
-    var AUTOSAVE = true;
-
-//  if (typeof TIMESHEETALERTS === undefined) {TIMESHEETALERTS = false;}
-//  if (typeof AUTOSAVE === undefined) {AUTOSAVE = true;}
+    var AUTOSAVE = false;
 
   function getDayHeaders() {
     return Array.from(document.querySelectorAll('thead th.sticky-day-header')).map(th => {
@@ -35,12 +32,24 @@
     });
   }
 
+  // Read target hours per day from the tfoot row (second div = target)
+  function getDailyTargetHours(dayHeaders) {
+    const tfootRow = document.querySelector('tfoot tr');
+    if (!tfootRow) return dayHeaders.map(() => 7.5);
+    const cells = Array.from(tfootRow.querySelectorAll('td'));
+    return cells.map(td => {
+      const divs = td.querySelectorAll('div');
+      // Second div is the target hours for that day
+      return divs[1] ? parseNum(divs[1].textContent.trim()) : 0;
+    });
+  }
+
   function getProjectRowsInfo(dayHeaders) {
     return Array.from(document.querySelectorAll("tbody tr")).map(tr => {
       const penultCols = tr.querySelectorAll('td.sticky-penultimate-column');
       if (!penultCols.length) return null;
       const hours = parseNum(penultCols[0]?.querySelectorAll('div')[1]?.textContent || "");
-      if (!hours) return null;
+      if (hours != "0" && !hours) return null;
       const allDayCells = Array.from(tr.querySelectorAll('td.hour-input-cell'));
       let inputsByDay = [];
       for (let i = 0; i < dayHeaders.length; ++i) {
@@ -49,14 +58,13 @@
           inputsByDay.push(null);
         } else {
           let inp = td.querySelector("input.input-hours");
-          let kind = td.style.backgroundColor=='pink' ? 'FULLDAY' : 'NORMAL';
           if (inp){
-              if (inp && inp.disabled) inp = null;
-              inp.daytype = kind;
+              if (inp.disabled) inp = null;
               inputsByDay.push(inp || null);
-          }else{
+          } else {
+            // Weekend or non-editable cell with a span
             let span = td.querySelector("span");
-            inputsByDay.push(span);
+            inputsByDay.push(span || null);
           }
         }
       }
@@ -66,122 +74,119 @@
 
   function getValue(inp){
       if (!inp) return 0;
-      if (inp.value !== "" && inp.value != null) {
+      if (inp.value !== undefined && inp.value !== "" && inp.value != null) {
           return parseNum(inp.value);
-      } else {
-          if (inp.innerText !== "") {
-            return parseNum(inp.innerText);
-          }
       }
-      return 0
+      if (inp.innerText && inp.innerText.trim() !== "") {
+          return parseNum(inp.innerText);
+      }
+      return 0;
+  }
+
+  function isEditable(inp) {
+      return inp && inp.tagName === 'INPUT' && !inp.disabled;
   }
 
   function autofill() {
 
     const dayHeaders = getDayHeaders();
+    const dailyTargets = getDailyTargetHours(dayHeaders);
     const projects = getProjectRowsInfo(dayHeaders);
-      // erase current information
+
+    // Compute available hours per project (estimated minus any pre-filled travel/full-day values)
     projects.forEach(proj => {
       proj.availHours = proj.hours;
-      proj.inputsByDay.forEach(inp => {
-        if (inp && !inp.disabled && inp.daytype == "NORMAL" ) inp.value = "";
-        if (inp && !inp.disabled && inp.daytype == "FULLDAY" ) {
-            // full days (travel, etc) are pre-filled so they don't count
-            proj.availHours -= 7.5;
-            inp.value = "7,5";
-        }
-      });
     });
 
-      let percentShare = projects.map((proj, row) => {
-          proj.hours;
+    // Clear all editable normal cells first
+    projects.forEach(proj => {
+      proj.inputsByDay.forEach(inp => {
+        if (isEditable(inp)) inp.value = "";
       });
-      let totalWorkingHours = percentShare.reduce((a,b)=>a+b,0);
-      percentShare = projects.map((proj, row) => {
-          proj.hours/totalWorkingHours;
-      });
+    });
 
     const workingDays = dayHeaders
       .map((hdr, idx) => hdr.isWeekend ? null : idx)
       .filter(idx => idx !== null);
 
-    // For each day, fill out until no more hours are available
+    // For each working day, fill out proportionally
     for (let di = 0; di < workingDays.length; ++di) {
       let idx = workingDays[di];
+      let dailyTarget = dailyTargets[idx] || 7.5;
 
       // For all projects, compute known/pre-filled values for this day
       let sumPreFilled = 0;
       let fillRequests = [];
 
       projects.forEach(proj => {
-        // We first look at pre-filled values to see how many hours we need to fill for this day
         let inp = proj.inputsByDay[idx];
         if (!inp) return;
-        if (inp.value !== "") {
+        if (!isEditable(inp)) {
+          // Non-editable (span or disabled): count its value
+          sumPreFilled += getValue(inp);
+        } else if (inp.value !== "") {
+          // Already has a value (pre-filled)
           sumPreFilled += getValue(inp);
         } else {
-          if (inp.innerText !== "") {
-            sumPreFilled += getValue(inp);
-          } else {
-            fillRequests.push({ proj, inp, idx });
-          }
+          fillRequests.push({ proj, inp, idx });
         }
       });
 
-      // Proportionally allocate the remaining hours
-      let totalHoursLeft = 7.5 - sumPreFilled;
+      // Remaining hours to distribute for this day
+      let totalHoursLeft = dailyTarget - sumPreFilled;
 
-
-      // Gather for each project: remaining to allocate and slots left
-      let remainHoursArr = fillRequests.map((fq, row) => {
-        // For this project, total hours minus sum of all currently filled cells in this row
-        let inputVals = fq.proj.inputsByDay.map((inp2,i) => getValue(inp2));
+      // For each fillable project, compute average remaining hours per empty slot
+      let remainHoursArr = fillRequests.map(fq => {
+        let inputVals = fq.proj.inputsByDay.map(inp2 => getValue(inp2));
         let sumSoFar = inputVals.reduce((a,b)=>a+b,0);
-        // Empty slots in this project (this row) that are editable and empty
-        let emptySlotsProj = fq.proj.inputsByDay.filter(inp2 => inp2 && inp2.value === "").length;
+        let emptySlotsProj = fq.proj.inputsByDay.filter(inp2 => isEditable(inp2) && inp2.value === "").length;
         let rem = Math.max(0, fq.proj.availHours - sumSoFar);
-        // If no slots left, give zero (should not happen!)
         let avg = emptySlotsProj ? rem / emptySlotsProj : 0;
-        //
-        //let actualHours = roundHalf(totalHoursLeft * (rem/totalShare))
         return {"avg": avg, "rem": rem};
       });
 
-
-      let totalShare = 0;
-       remainHoursArr.forEach((a) => {totalShare += a.avg; return null}) ;
+      let totalShare = remainHoursArr.reduce((a, item) => a + item.avg, 0);
 
       // Distribute according to share, respecting 0.5 increments
-      let allocs = remainHoursArr.map( item => {
-            let intent = roundHalf(totalHoursLeft * (item.avg/totalShare));
-            return Math.min(intent,item.rem);
-       });
-      // Adjust for rounding drift so all missing cells are filled
-      let drift = totalHoursLeft - allocs.reduce((a,b)=>a+b,0);
-      let adj = 0;
-        // the following has a bug I cannot fix (Fer)
-     /* while (Math.abs(drift) >= 0.26 && adj < fillRequests.length*2 && allocs.length) {
-        if (drift > 0) allocs[adj%allocs.length] += 0.5;
-        else if (drift < 0 && allocs[adj%allocs.length] >= 0.5) allocs[adj%allocs.length] -= 0.5;
-        drift = totalHoursLeft - allocs.reduce((a,b)=>a+b,0);
-        adj++;
-      }*/
+      let allocs;
+      if (totalShare > 0) {
+        allocs = remainHoursArr.map(item => {
+          let intent = roundHalf(totalHoursLeft * (item.avg / totalShare));
+          return Math.min(intent, item.rem);
+        });
+      } else {
+        allocs = remainHoursArr.map(() => 0);
+      }
 
-      // Now do the actual filling
+      // Fix rounding drift
+      let drift = roundHalf(totalHoursLeft - allocs.reduce((a,b)=>a+b,0));
+      let adj = 0;
+      while (Math.abs(drift) >= 0.25 && adj < fillRequests.length * 4 && allocs.length) {
+        let i = adj % allocs.length;
+        if (drift > 0 && remainHoursArr[i].rem > allocs[i]) {
+          allocs[i] += 0.5;
+        } else if (drift < 0 && allocs[i] >= 0.5) {
+          allocs[i] -= 0.5;
+        }
+        drift = roundHalf(totalHoursLeft - allocs.reduce((a,b)=>a+b,0));
+        adj++;
+      }
+
+      // Do the actual filling
       fillRequests.forEach((fq, i) => {
         let valToSet = allocs[i] > 0 ? allocs[i] : 0;
         fq.inp.value = valToSet.toString().replace('.', ',');
       });
     }
 
-    // After all, if any cell is still empty, set it to zero
+    // After all, if any editable cell is still empty, set it to zero
     projects.forEach(proj =>
-      proj.inputsByDay.forEach(inp=>{
-        if(inp && inp.value === "") inp.value = "0";
+      proj.inputsByDay.forEach(inp => {
+        if (isEditable(inp) && inp.value === "") inp.value = "0";
       })
     );
 
-    if (TIMESHEETALERTS) {alert("¡Las celdas vacías han sido rellenadas proporcionalmente, las horas han sido puestas en 0 donde corresponde!");}
+    if (TIMESHEETALERTS) {alert("Timesheet filled out proportionally!");}
     if (AUTOSAVE) { saveALL();}
   }
 
@@ -191,10 +196,58 @@
     const projects = getProjectRowsInfo(dayHeaders);
     projects.forEach(proj => {
       proj.inputsByDay.forEach(inp => {
-        if (inp && !inp.disabled) inp.value = "";
+        if (isEditable(inp)) inp.value = "0";
       });
     });
-    if (TIMESHEETALERTS) {alert("Todas las celdas editables han sido borradas.");}
+    if (TIMESHEETALERTS) {alert("All editable cells have been cleared.");}
+  }
+
+  // Server-side auto-fill (uses the built-in API)
+  function serverAutoFill() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const personId = urlParams.get('personId') || document.querySelector('[data-projectid]')?.closest('tr')?.querySelector('input.input-hours')?.getAttribute('data-day')?.split('-')[0];
+    const monthSelect = document.getElementById('monthSelect');
+    const yearSelect = document.getElementById('yearSelect');
+
+    // Try to get personId from inputs on the page
+    let pid = urlParams.get('personId');
+    if (!pid) {
+      // Fallback: extract from any input's data attributes or page URL
+      const firstInput = document.querySelector('input.input-hours');
+      if (firstInput) {
+        // personId is typically in the save endpoint; try the URL
+        const match = window.location.href.match(/personId=(\d+)/);
+        pid = match ? match[1] : null;
+      }
+    }
+
+    let month = monthSelect?.value;
+    let year = yearSelect?.value;
+
+    if (!pid || !month || !year) {
+      alert('Could not determine person/month/year. Please navigate using the Go button first.');
+      return;
+    }
+
+    if (!confirm(`Auto-fill timesheet for ${month}/${year} using server logic? This may overwrite existing data.`)) return;
+
+    fetch('/Timesheet/AutoFillTimesheetForPersonAndMonth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        personId: parseInt(pid, 10),
+        targetMonth: `${year}-${String(month).padStart(2, '0')}-01T00:00:00`
+      })
+    })
+    .then(r => r.json())
+    .then(data => {
+      alert(data.message || (data.success ? 'Done!' : 'Error'));
+      if (data.success) location.reload();
+    })
+    .catch(err => {
+      console.error('AutoFill error:', err);
+      alert('Error during auto-fill.');
+    });
   }
 
   function waitTable(fn) {
@@ -226,7 +279,6 @@
           waitTable(callback);
         });
         li.appendChild(a);
-        // To put eraseAll *below* autofill, insert after if already present
         let ref = document.getElementById("tm-autofill-prop");
         if (ref && id==="tm-erase-all" && ref.parentElement && ref.parentElement.nextSibling) {
           ref.parentElement.parentElement.insertBefore(li, ref.parentElement.nextSibling);
@@ -240,13 +292,15 @@
     tryAdd();
   }
 
-  function addButton(label, id, iconClass, callback) {
+  function addButton(label, id, className, callback) {
     let added = false;
     function tryAddBut() {
-      const flex = document.querySelector('div.justify-content-center');
+      // Try the new layout first, then fall back to old
+      const flex = document.querySelector('div.timesheet-actions-group')
+                || document.querySelector('div.justify-content-center');
       if (flex && !document.getElementById(id)) {
-        const button = document.createElement('button');// <button id="saveAllButton" class="btn btn-success">Save All</button>
-        button.className = "btn btn-danger";
+        const button = document.createElement('button');
+        button.className = className || "btn btn-danger";
         button.innerHTML = label;
         button.id = id;
         button.addEventListener('click', function (e) {
@@ -293,23 +347,23 @@
         var invalidInputs = [];
 
         document.querySelectorAll('.input-hours').forEach(input => {
-            // Reemplaza la coma por un punto para asegurar el correcto parsing del valor decimal
             var originalValue = input.getAttribute('data-original-value').replace(',', '.');
             var currentValue = input.value.replace(',', '.');
 
-            // Parsea ambos valores como flotantes
             originalValue = parseFloat(originalValue);
             currentValue = parseFloat(currentValue);
 
-            // Validación de que el valor sea entero o decimal con .5
                 if (isNaN(currentValue) || currentValue < 0) {
                     invalidInputs.push(input);
                 } else {
                 if (Math.round(currentValue * 100) / 100 !== Math.round(originalValue * 100) / 100) {
+                    // Extract personId from URL
+                    const match = window.location.href.match(/personId=(\d+)/);
+                    const personId = match ? parseInt(match[1], 10) : 509;
                     changedTimesheets.push({
                         ProjectId: parseInt(input.getAttribute('data-projectid'), 10),
                         WpId: parseInt(input.getAttribute('data-wpid'), 10),
-                        PersonId: 509,
+                        PersonId: personId,
                         Day: input.getAttribute('data-day'),
                         Hours: currentValue
                     });
@@ -350,12 +404,26 @@
 
 
     addUtilidadesMenuButton("Borrar todos", "tm-erase-all", "bi bi-trash", eraseAll);
-  // addUtilidadesMenuButton("Rellenar Proporcionalmente", "tm-autofill-prop", "bi bi-magic", autofill);
     addUtilidadesMenuButton("Turn alerts on", "tm-alerts-prop", "bi bi-magic", switchAlerting );
     addUtilidadesMenuButton("Turn autosave off", "tm-autosave-prop", "bi bi-magic", switchSaving );
 
-    addButton("Fill out", "autofill-button", "", autofill);
+    addButton("Fill out", "autofill-button", "btn btn-success", autofill);
+    addButton("Server Auto-Fill", "server-autofill-button", "btn btn-warning ms-2", serverAutoFill);
 
 })();
+// ==UserScript==
+// @name         New Userscript
+// @namespace    http://tampermonkey.net/
+// @version      2026-03-05
+// @description  try to take over the world!
+// @author       You
+// @match        https://opstrs03.bsc.es/Timesheet/GetTimeSheetsForPerson?personId=509&year=2026&month=2
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=bsc.es
+// @grant        none
+// ==/UserScript==
 
+(function() {
+    'use strict';
 
+    // Your code here...
+})();
