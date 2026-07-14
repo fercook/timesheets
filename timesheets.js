@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BSC Time sheets
 // @namespace    http://tampermonkey.net/
-// @version      2026-02-05
+// @version      2026-03-05
 // @description  Auto-fill BSC timesheets
 // @author       You
 // @match        https://opstrs03.bsc.es/Time*heet/*
